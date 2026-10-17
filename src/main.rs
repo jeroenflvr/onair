@@ -10,6 +10,8 @@ use chrono::Local;
 use reqwest::blocking::Client;
 use serde_json::json;
 
+mod network;
+
 const TEAMS_PROCESSES: &[&str] = &["MSTeams", "Microsoft Teams"];
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const OFF_DELAY: Duration = Duration::from_secs(3);
@@ -135,12 +137,51 @@ fn run() -> Result<(), Box<dyn Error>> {
             "ONAIR_URL is not set in the .env file",
         )
     })?;
+    let home_router_mac = std::env::var("ONAIR_HOME_ROUTER_MAC")
+        .map_err(|_| io::Error::other("ONAIR_HOME_ROUTER_MAC is not set in the .env file"))?;
+    let home_router_mac = network::parse_mac(&home_router_mac)
+        .map_err(|error| io::Error::other(format!("invalid ONAIR_HOME_ROUTER_MAC: {error}")))?;
     let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
     let mut led_state = None;
     let mut idle_since: Option<Instant> = None;
+    let mut home_state = None;
+    let mut network_error = None;
 
     loop {
+        let at_home = match network::at_home(&home_router_mac) {
+            Ok(at_home) => {
+                network_error = None;
+                at_home
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if network_error.as_ref() != Some(&message) {
+                    eprintln!("network check error: {message}");
+                    network_error = Some(message);
+                }
+                false
+            }
+        };
+        if home_state != Some(at_home) {
+            println!(
+                "{} {}",
+                timestamp(),
+                if at_home {
+                    "home network detected"
+                } else {
+                    "not on home network; LED requests paused"
+                }
+            );
+            home_state = Some(at_home);
+        }
+        if !at_home {
+            led_state = None;
+            idle_since = None;
+            thread::sleep(POLL_INTERVAL);
+            continue;
+        }
+
         let poll_result = (|| -> Result<(), Box<dyn Error>> {
             let busy = teams_running()? && core_audio::microphone_in_use()?;
             if busy {
