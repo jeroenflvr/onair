@@ -10,7 +10,7 @@ Set the LED board endpoint in `.env`:
 
 ```sh
 ONAIR_URL=http://your-led-board/power
-ONAIR_HOME_ROUTER_MAC=02:10:18:3d:a5:83
+ONAIR_HOME_ROUTER_MAC=the:mac:address
 ```
 
 Set `ONAIR_HOME_ROUTER_MAC` to your home router's MAC address, not your Mac's
