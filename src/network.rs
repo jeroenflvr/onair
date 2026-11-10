@@ -1,77 +1,53 @@
-use std::{io, net::Ipv4Addr, process::Command};
+use std::{io, process::Command};
 
-pub fn parse_mac(value: &str) -> io::Result<[u8; 6]> {
-    let mut mac = [0; 6];
-    let parts: Vec<_> = value.split(':').collect();
-    if parts.len() != mac.len() {
-        return Err(io::Error::other("expected a six-byte MAC address"));
-    }
-    for (byte, part) in mac.iter_mut().zip(parts) {
-        if part.is_empty() || part.len() > 2 || !part.bytes().all(|c| c.is_ascii_hexdigit()) {
-            return Err(io::Error::other("invalid MAC address byte"));
-        }
-        *byte = u8::from_str_radix(part, 16).map_err(io::Error::other)?;
-    }
-    Ok(mac)
-}
-
-fn gateway_and_interface(output: &str) -> Option<(Ipv4Addr, &str)> {
-    let mut gateway = None;
-    let mut interface = None;
-    for line in output.lines() {
-        if let Some((key, value)) = line.trim().split_once(':') {
-            match key {
-                "gateway" => gateway = value.trim().parse().ok(),
-                "interface" => interface = Some(value.trim()),
-                _ => {}
-            }
-        }
-    }
-    Some((gateway?, interface?))
-}
-
-fn router_matches(output: &str, expected: &[u8; 6]) -> io::Result<bool> {
-    let words: Vec<_> = output.split_whitespace().collect();
-    let address = words
-        .windows(2)
-        .find(|pair| pair[0] == "at")
-        .map(|pair| pair[1])
-        .ok_or_else(|| io::Error::other("could not read router MAC from arp output"))?;
-    if address == "(incomplete)" {
-        return Ok(false);
-    }
-    Ok(parse_mac(address)? == *expected)
-}
-
-pub fn at_home(expected: &[u8; 6]) -> io::Result<bool> {
-    let route = Command::new("/sbin/route")
-        .args(["-n", "get", "default"])
-        .output()?;
-    if !route.status.success() {
+fn command_output(program: &str, args: &[&str]) -> io::Result<String> {
+    let output = Command::new(program).args(args).output()?;
+    if !output.status.success() {
         return Err(io::Error::other(format!(
-            "default gateway lookup failed: {}",
-            String::from_utf8_lossy(&route.stderr).trim()
+            "{program} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let route_text = String::from_utf8(route.stdout).map_err(io::Error::other)?;
-    let Some((gateway, interface)) = gateway_and_interface(&route_text) else {
-        // Tunnels and non-IPv4 gateways cannot establish a home-router match.
-        return Ok(false);
-    };
-    let arp = Command::new("/usr/sbin/arp")
-        .args(["-n", "-i", interface, &gateway.to_string()])
-        .output()?;
-    let arp_text = String::from_utf8(arp.stdout).map_err(io::Error::other)?;
-    if !arp.status.success() {
-        if arp.status.code() == Some(1) && arp_text.contains("no entry") {
-            return Ok(false);
+    String::from_utf8(output.stdout).map_err(io::Error::other)
+}
+
+fn wifi_device(output: &str) -> Option<&str> {
+    let mut lines = output.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "Hardware Port: Wi-Fi" {
+            return lines.next()?.trim().strip_prefix("Device:").map(str::trim);
         }
-        return Err(io::Error::other(format!(
-            "router MAC lookup failed: {}",
-            String::from_utf8_lossy(&arp.stderr).trim()
-        )));
     }
-    router_matches(&arp_text, expected)
+    None
+}
+
+pub fn find_wifi_device() -> io::Result<String> {
+    let output = command_output("/usr/sbin/networksetup", &["-listallhardwareports"])?;
+    wifi_device(&output)
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("no Wi-Fi interface found"))
+}
+
+fn ssid(summary: &str) -> Option<&str> {
+    summary.lines().find_map(|line| {
+        let (key, value) = line.split_once(" : ")?;
+        (key.trim() == "SSID").then_some(value.trim())
+    })
+}
+
+fn current_ssid(device: &str) -> io::Result<Option<String>> {
+    let summary = command_output("/usr/sbin/ipconfig", &["getsummary", device])?;
+    match ssid(&summary) {
+        Some("<redacted>") => Err(io::Error::other(
+            "macOS redacted the Wi-Fi name; run `sudo ipconfig setverbose 1` once",
+        )),
+        Some(name) => Ok(Some(name.to_owned())),
+        None => Ok(None),
+    }
+}
+
+pub fn at_home(device: &str, home_ssid: &str) -> io::Result<bool> {
+    Ok(current_ssid(device)?.as_deref() == Some(home_ssid))
 }
 
 #[cfg(test)]
@@ -79,39 +55,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mac_addresses_accept_macos_unpadded_bytes_and_case() {
-        assert_eq!(
-            parse_mac("2:10:18:3D:A5:83").unwrap(),
-            parse_mac("02:10:18:3d:a5:83").unwrap()
-        );
+    fn finds_wifi_device() {
+        let output = "Hardware Port: Ethernet\nDevice: en1\n\nHardware Port: Wi-Fi\nDevice: en0\nEthernet Address: aa:bb\n";
+        assert_eq!(wifi_device(output), Some("en0"));
+        assert_eq!(wifi_device("Hardware Port: Ethernet\nDevice: en1\n"), None);
     }
 
     #[test]
-    fn rejects_invalid_mac_addresses() {
-        for value in ["", "02:10:18", "02:10:18:3d:a5:833", "02:10:18:3d:a5:gg"] {
-            assert!(parse_mac(value).is_err(), "{value}");
-        }
-    }
-
-    #[test]
-    fn reads_gateway_and_interface() {
-        assert_eq!(
-            gateway_and_interface("    gateway: 192.168.0.1\n  interface: en0\n"),
-            Some((Ipv4Addr::new(192, 168, 0, 1), "en0"))
-        );
-        assert_eq!(
-            gateway_and_interface("gateway: link#20\ninterface: utun0"),
-            None
-        );
-        assert_eq!(gateway_and_interface("interface: en0"), None);
-    }
-
-    #[test]
-    fn matches_only_the_configured_router() {
-        let home = parse_mac("02:10:18:3d:a5:83").unwrap();
-        assert!(router_matches("? (192.168.0.1) at 2:10:18:3d:a5:83 on en0", &home).unwrap());
-        assert!(!router_matches("? (192.168.0.1) at aa:bb:cc:dd:ee:ff on en0", &home).unwrap());
-        assert!(!router_matches("? (192.168.0.1) at (incomplete) on en0", &home).unwrap());
-        assert!(router_matches("unexpected output", &home).is_err());
+    fn reads_ssid_from_summary() {
+        let summary = "<dictionary> {\n  BSSID : aa:bb\n  SSID : My Home Net\n  Security : WPA2\n}";
+        assert_eq!(ssid(summary), Some("My Home Net"));
+        assert_eq!(ssid("<dictionary> {\n  BSSID : aa:bb\n}"), None);
     }
 }

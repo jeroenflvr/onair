@@ -10,33 +10,28 @@ Set the LED board endpoint in `.env`:
 
 ```sh
 ONAIR_URL=http://your-led-board/power
-ONAIR_HOME_ROUTER_MAC=the:mac:address
+ONAIR_HOME_SSID=My Home Wi-Fi
 ```
 
-Set `ONAIR_HOME_ROUTER_MAC` to your home router's MAC address, not your Mac's
-Wi-Fi address. While connected at home, find the default gateway and then its
-MAC address using the interface and gateway shown by the first command:
+Set `ONAIR_HOME_SSID` to the exact (case-sensitive) name of your home Wi-Fi
+network.
+
+Recent macOS versions hide the Wi-Fi name from command-line tools. Run this
+once to allow the bridge to read it (the setting persists across reboots):
 
 ```sh
-/sbin/route -n get default
-/usr/sbin/arp -n -i en0 192.168.0.1
+sudo ipconfig setverbose 1
 ```
 
-Replace `en0` and `192.168.0.1` with your actual interface and gateway. Use the
-address after `at` in the ARP output; single-digit bytes are accepted.
+Verify it with `ipconfig getsummary en0 | grep ' SSID'`; it should show your
+network name instead of `<redacted>`.
 
-Before polling Teams or sending LED requests, the bridge checks that the
-current default IPv4 gateway has the configured MAC address. Away from home,
-offline, or when the router cannot be identified, HTTP requests are paused.
-The bridge automatically resumes and resynchronizes the LED when home is
-detected again. Network status is logged only on changes; identical network
-check errors are logged once until recovery.
-
-This works with Wi-Fi or Ethernet using the same router. A VPN that changes
-the default gateway may pause the bridge even at home. An absent or incomplete
-ARP entry also pauses it until macOS learns the gateway address through normal
-network traffic. Router MAC matching avoids relying on a private IP range
-alone, but is not an authentication mechanism.
+Before polling Teams or sending LED requests, the bridge checks that the Mac
+is connected to the configured Wi-Fi network. Away from home, offline, or on
+Ethernet without Wi-Fi, HTTP requests are paused. The bridge automatically
+resumes and resynchronizes the LED when home is detected again. Network status
+is logged only on changes; identical network check errors are logged once until
+recovery. Matching on the network name is not an authentication mechanism.
 
 The Teams process names, polling interval, and off delay can be configured at
 the top of `src/main.rs`.

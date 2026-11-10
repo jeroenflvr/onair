@@ -37,12 +37,21 @@ mod core_audio {
             data_size: *mut u32,
             data: *mut c_void,
         ) -> i32;
+        fn AudioObjectGetPropertyDataSize(
+            object_id: u32,
+            address: *const AudioObjectPropertyAddress,
+            qualifier_data_size: u32,
+            qualifier_data: *const c_void,
+            data_size: *mut u32,
+        ) -> i32;
     }
 
     const SYSTEM_OBJECT: u32 = 1;
-    const DEFAULT_INPUT_DEVICE: u32 = fourcc(b"dIn ");
+    const DEVICES: u32 = fourcc(b"dev#");
+    const STREAMS: u32 = fourcc(b"stm#");
     const DEVICE_IS_RUNNING: u32 = fourcc(b"gone");
     const GLOBAL_SCOPE: u32 = fourcc(b"glob");
+    const INPUT_SCOPE: u32 = fourcc(b"inpt");
 
     const fn fourcc(value: &[u8; 4]) -> u32 {
         u32::from_be_bytes(*value)
@@ -75,13 +84,57 @@ mod core_audio {
         Ok(value)
     }
 
-    pub fn microphone_in_use() -> io::Result<bool> {
-        let device = property_u32(SYSTEM_OBJECT, DEFAULT_INPUT_DEVICE)?;
-        if device == 0 {
-            return Ok(false);
+    fn property_size(object_id: u32, selector: u32, scope: u32) -> io::Result<u32> {
+        let address = AudioObjectPropertyAddress {
+            selector,
+            scope,
+            element: 0,
+        };
+        let mut size = 0_u32;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(object_id, &address, 0, std::ptr::null(), &mut size)
+        };
+        if status != 0 {
+            return Err(io::Error::other(format!("CoreAudio error {status}")));
         }
+        Ok(size)
+    }
 
-        Ok(property_u32(device, DEVICE_IS_RUNNING)? != 0)
+    fn devices() -> io::Result<Vec<u32>> {
+        let size = property_size(SYSTEM_OBJECT, DEVICES, GLOBAL_SCOPE)?;
+        let mut ids = vec![0_u32; size as usize / std::mem::size_of::<u32>()];
+        let mut data_size = size;
+        let address = AudioObjectPropertyAddress {
+            selector: DEVICES,
+            scope: GLOBAL_SCOPE,
+            element: 0,
+        };
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                SYSTEM_OBJECT,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut data_size,
+                ids.as_mut_ptr().cast(),
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::other(format!("CoreAudio error {status}")));
+        }
+        ids.truncate(data_size as usize / std::mem::size_of::<u32>());
+        Ok(ids)
+    }
+
+    // Teams may use a mic other than the system default, so check every input device.
+    pub fn microphone_in_use() -> io::Result<bool> {
+        for device in devices()? {
+            let has_input = property_size(device, STREAMS, INPUT_SCOPE).is_ok_and(|s| s > 0);
+            if has_input && property_u32(device, DEVICE_IS_RUNNING).is_ok_and(|v| v != 0) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -137,10 +190,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             "ONAIR_URL is not set in the .env file",
         )
     })?;
-    let home_router_mac = std::env::var("ONAIR_HOME_ROUTER_MAC")
-        .map_err(|_| io::Error::other("ONAIR_HOME_ROUTER_MAC is not set in the .env file"))?;
-    let home_router_mac = network::parse_mac(&home_router_mac)
-        .map_err(|error| io::Error::other(format!("invalid ONAIR_HOME_ROUTER_MAC: {error}")))?;
+    let home_ssid = std::env::var("ONAIR_HOME_SSID")
+        .map_err(|_| io::Error::other("ONAIR_HOME_SSID is not set in the .env file"))?;
+    let wifi_device = network::find_wifi_device()?;
     let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
 
     let mut led_state = None;
@@ -149,7 +201,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut network_error = None;
 
     loop {
-        let at_home = match network::at_home(&home_router_mac) {
+        let at_home = match network::at_home(&wifi_device, &home_ssid) {
             Ok(at_home) => {
                 network_error = None;
                 at_home
